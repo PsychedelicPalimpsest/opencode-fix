@@ -18,7 +18,7 @@ import { Parameters as Lsp } from "../../src/tool/lsp"
 import { Parameters as Plan } from "../../src/tool/plan"
 import { Parameters as Question } from "../../src/tool/question"
 import { Parameters as Read } from "../../src/tool/read"
-import { Parameters as Shell } from "../../src/tool/shell"
+import { BaseParameters as ShellBase, Parameters as Shell } from "../../src/tool/shell"
 import { Parameters as Skill } from "../../src/tool/skill"
 import { Parameters as Task } from "../../src/tool/task"
 import { Parameters as Todo } from "../../src/tool/todo"
@@ -37,7 +37,8 @@ const toJsonSchema = ToolJsonSchema.fromSchema
 describe("tool parameters", () => {
   describe("JSON Schema (wire shape)", () => {
     test("apply_patch", () => expect(toJsonSchema(ApplyPatch)).toMatchSnapshot())
-    test("bash", () => expect(toJsonSchema(Shell)).toMatchSnapshot())
+    test("bash", () => expect(toJsonSchema(ShellBase)).toMatchSnapshot())
+    test("bash (background)", () => expect(toJsonSchema(Shell)).toMatchSnapshot())
     test("edit", () => expect(toJsonSchema(Edit)).toMatchSnapshot())
     test("glob", () => expect(toJsonSchema(Glob)).toMatchSnapshot())
     test("grep", () => expect(toJsonSchema(Grep)).toMatchSnapshot())
@@ -114,11 +115,22 @@ describe("tool parameters", () => {
       expect(parsed.timeout).toBe(5000)
       expect(parsed.workdir).toBe("/tmp")
     })
+    test("accepts optional background + session_id", () => {
+      const parsed = parse(Shell, { command: "ls", description: "list", background: true, session_id: "shell_1" })
+      expect(parsed.background).toBe(true)
+      expect(parsed.session_id).toBe("shell_1")
+    })
     test("rejects missing description", () => {
       expect(accepts(Shell, { command: "ls" })).toBe(false)
     })
     test("rejects missing command", () => {
       expect(accepts(Shell, { description: "list" })).toBe(false)
+    })
+    test("base schema hides background and session_id", () => {
+      const json = toJsonSchema(ShellBase)
+      const properties = (json.properties as Record<string, unknown> | undefined) ?? {}
+      expect(properties.background).toBeUndefined()
+      expect(properties.session_id).toBeUndefined()
     })
   })
 

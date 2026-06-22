@@ -20,6 +20,8 @@ import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
+import { BackgroundJob } from "@/background/job"
+import { ShellSessions } from "@/tool/shell/sessions"
 
 const shellLayer = Layer.mergeAll(
   CrossSpawnSpawner.defaultLayer,
@@ -29,9 +31,24 @@ const shellLayer = Layer.mergeAll(
   Config.defaultLayer,
   Agent.defaultLayer,
   RuntimeFlags.defaultLayer,
+  BackgroundJob.defaultLayer,
+  ShellSessions.defaultLayer,
+  testInstanceStoreLayer,
+)
+const backgroundShellLayer = Layer.mergeAll(
+  CrossSpawnSpawner.defaultLayer,
+  FSUtil.defaultLayer,
+  Plugin.defaultLayer,
+  Truncate.defaultLayer,
+  Config.defaultLayer,
+  Agent.defaultLayer,
+  RuntimeFlags.layer({ experimentalBackgroundShell: true }),
+  BackgroundJob.defaultLayer,
+  ShellSessions.defaultLayer,
   testInstanceStoreLayer,
 )
 const it = testEffect(shellLayer)
+const itBg = testEffect(backgroundShellLayer)
 type ShellTestServices =
   | (typeof shellLayer extends Layer.Layer<infer ROut, infer _E, infer _RIn> ? ROut : never)
   | InstanceStore.Service
@@ -1234,5 +1251,200 @@ describe("tool.shell truncation", () => {
         expect(lines[lineCount - 1]).toBe(String(lineCount))
       }),
     ),
+  )
+})
+
+describe("tool.shell background", () => {
+  it.live(
+    "rejects background=true when experimental background shell is disabled",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const err = yield* fail({
+            command: "echo hello",
+            description: "Echo hello in background",
+            background: true,
+          })
+          expect(err.message).toContain("OPENCODE_EXPERIMENTAL_BACKGROUND_SHELL")
+        }),
+      ),
+  )
+
+  itBg.live(
+    "background=true returns a session_id and the job is still running",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run({
+            command: "sleep 30",
+            description: "Long sleep",
+            background: true,
+          })
+
+          const metadata = result.metadata as { sessionId?: string; status?: string }
+          expect(metadata.sessionId).toBeDefined()
+          expect(metadata.sessionId).toMatch(/^shell_/)
+          expect(metadata.status).toBe("running")
+          expect(result.output).toContain("Background shell started")
+          expect(result.output).toContain(metadata.sessionId!)
+          expect(result.output).toContain("Use session_id=")
+        }),
+      ),
+    15_000,
+  )
+
+  itBg.live(
+    "background job accumulates streamed output in the session store",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const started = yield* run({
+            command: `echo first && sleep 0.1 && echo second`,
+            description: "Stream into background",
+            background: true,
+          })
+          const sessionId = (started.metadata as { sessionId?: string }).sessionId!
+          expect(sessionId).toBeDefined()
+
+          // Wait for the job to complete so we can assert against the stored session.
+          const wait = yield* BackgroundJob.Service
+          const waited = yield* wait.wait({ id: sessionId, timeout: 10_000 })
+          expect(waited.timedOut).toBe(false)
+          expect(waited.info?.status).toBe("completed")
+
+          const sessions = yield* ShellSessions.Service
+          const session = yield* sessions.get(sessionId)
+          expect(session).toBeDefined()
+          expect(session?.status).toBe("completed")
+          expect(session?.exit).toBe(0)
+          expect(session?.output).toContain("first")
+          expect(session?.output).toContain("second")
+        }),
+      ),
+    15_000,
+  )
+
+  itBg.live(
+    "session_id returns the current state of a backgrounded shell command",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const started = yield* run({
+            command: "echo viewable",
+            description: "Run and view",
+            background: true,
+          })
+          const sessionId = (started.metadata as { sessionId?: string }).sessionId!
+
+          const viewed = yield* run({
+            command: "placeholder",
+            description: "view placeholder",
+            session_id: sessionId,
+          })
+          const metadata = viewed.metadata as { sessionId?: string; status?: string }
+          expect(metadata.sessionId).toBe(sessionId)
+          expect(metadata.status).toBeDefined()
+          expect(["running", "completed", "error"]).toContain(metadata.status ?? "")
+          expect(viewed.output).toContain(`id="${sessionId}"`)
+          expect(viewed.output).toContain("<command>echo viewable</command>")
+        }),
+      ),
+    15_000,
+  )
+
+  itBg.live(
+    "session_id errors when the id is unknown",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const err = yield* fail({
+            command: "placeholder",
+            description: "view missing",
+            session_id: "shell_does_not_exist",
+          })
+          expect(err.message).toContain("Unknown background shell session")
+        }),
+      ),
+  )
+
+  itBg.live(
+    "combining background=true and session_id fails",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const err = yield* fail({
+            command: "echo both",
+            description: "both params",
+            background: true,
+            session_id: "shell_anything",
+          })
+          expect(err.message).toContain("Cannot combine session_id")
+        }),
+      ),
+  )
+
+  itBg.live(
+    "background command non-zero exit marks the session as error",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run({
+            command: "exit 7",
+            description: "Non zero exit background",
+            background: true,
+          })
+          const sessionId = (result.metadata as { sessionId?: string }).sessionId!
+          const wait = yield* BackgroundJob.Service
+          const waited = yield* wait.wait({ id: sessionId, timeout: 5_000 })
+          expect(waited.timedOut).toBe(false)
+          const sessions = yield* ShellSessions.Service
+          const session = yield* sessions.get(sessionId)
+          expect(session?.status).toBe("completed")
+          expect(session?.exit).toBe(7)
+        }),
+      ),
+    15_000,
+  )
+
+  itBg.live(
+    "background command survives the original tool call's abort signal",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const controller = new AbortController()
+          const started = yield* run(
+            {
+              command: "sleep 5 && echo done",
+              description: "Survive abort",
+              background: true,
+            },
+            {
+              ...ctx,
+              abort: controller.signal,
+            },
+          )
+          const sessionId = (started.metadata as { sessionId?: string }).sessionId!
+          // Fire the abort on the original tool call - the background command must keep going.
+          controller.abort()
+
+          const wait = yield* BackgroundJob.Service
+          const waited = yield* wait.wait({ id: sessionId, timeout: 10_000 })
+          expect(waited.timedOut).toBe(false)
+          expect(waited.info?.status).toBe("completed")
+          const sessions = yield* ShellSessions.Service
+          const session = yield* sessions.get(sessionId)
+          expect(session?.status).toBe("completed")
+          expect(session?.output).toContain("done")
+        }),
+      ),
+    20_000,
   )
 })

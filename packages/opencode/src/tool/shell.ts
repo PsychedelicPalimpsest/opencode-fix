@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Cause, Effect, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -14,6 +14,8 @@ import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "./shell/id"
+import { BackgroundJob } from "@/background/job"
+import { ShellSessions, type ShellSession } from "./shell/sessions"
 
 import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
@@ -21,8 +23,9 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { ToolJsonSchema } from "./json-schema"
 
-export { Parameters } from "./shell/prompt"
+export { BaseParameters, Parameters } from "./shell/prompt"
 
 const MAX_METADATA_LENGTH = 30_000
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
@@ -79,6 +82,22 @@ type Scan = {
 type Chunk = {
   text: string
   size: number
+}
+
+type ShellMetadata = {
+  output?: string
+  description: string
+  truncated: boolean
+  exit?: number | null
+  outputPath?: string
+  sessionId?: string
+  status?: "running" | "completed" | "error" | "cancelled"
+}
+
+type ShellExecuteResult = {
+  title: string
+  metadata: ShellMetadata
+  output: string
 }
 
 const resolveWasm = (asset: string) => {
@@ -350,6 +369,8 @@ export const ShellTool = Tool.define(
     const trunc = yield* Truncate.Service
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
+    const background = yield* BackgroundJob.Service
+    const sessions = yield* ShellSessions.Service
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
 
     const cygpath = Effect.fn("ShellTool.cygpath")(function* (shell: string, text: string) {
@@ -441,7 +462,13 @@ export const ShellTool = Tool.define(
         description: string
       },
       ctx: Tool.Context,
+      options: {
+        onChunk?: (input: { output: string; description: string }) => Effect.Effect<void>
+        abort?: AbortSignal
+      } = {},
     ) {
+      const streamUpdate =
+        options.onChunk ?? ((p) => ctx.metadata({ metadata: { output: p.output, description: p.description } }))
       const limits = yield* trunc.limits()
       const keep = limits.maxBytes * 2
       let full = ""
@@ -479,11 +506,9 @@ export const ShellTool = Tool.define(
         ).pipe(Effect.catch(() => Effect.void))
       })
 
-      yield* ctx.metadata({
-        metadata: {
-          output: "",
-          description: input.description,
-        },
+      yield* streamUpdate({
+        output: "",
+        description: input.description,
       })
 
       const code: number | null = yield* Effect.scoped(
@@ -520,31 +545,28 @@ export const ShellTool = Tool.define(
                       }),
                     ),
                     Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                          description: input.description,
-                        },
+                      streamUpdate({
+                        output: last,
+                        description: input.description,
                       }),
                     ),
                   )
                 }
               }
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                  description: input.description,
-                },
+              return streamUpdate({
+                output: last,
+                description: input.description,
               })
             }),
           )
 
           const abort = Effect.callback<void>((resume) => {
-            if (ctx.abort.aborted) return resume(Effect.void)
+            const signal = options.abort ?? ctx.abort
+            if (signal.aborted) return resume(Effect.void)
             const handler = () => resume(Effect.void)
-            ctx.abort.addEventListener("abort", handler, { once: true })
-            return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+            signal.addEventListener("abort", handler, { once: true })
+            return Effect.sync(() => signal.removeEventListener("abort", handler))
           })
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
@@ -593,15 +615,49 @@ export const ShellTool = Tool.define(
         output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
       }
       return {
-        title: input.description,
-        metadata: {
-          output: last || preview(output),
-          exit: code,
-          description: input.description,
-          truncated: cut,
-          ...(cut && file ? { outputPath: file } : {}),
-        },
         output,
+        preview: last || preview(output),
+        exit: code,
+        truncated: cut,
+        outputPath: cut && file ? file : undefined,
+      }
+    })
+
+    const viewSession = Effect.fn("ShellTool.viewSession")(function* (id: string) {
+      const session = yield* sessions.get(id)
+      if (!session) {
+        return yield* Effect.fail(new Error(`Unknown background shell session: ${id}`))
+      }
+      const head = session.output || "(no output)"
+      const elapsed = Date.now() - session.startedAt
+      const lines = [
+        `<shell_session id="${session.id}" status="${session.status}">`,
+        `<started_at>${new Date(session.startedAt).toISOString()}</started_at>`,
+        `<elapsed_ms>${elapsed}</elapsed_ms>`,
+        ...(session.workdir ? [`<workdir>${session.workdir}</workdir>`] : []),
+        `<command>${session.command}</command>`,
+        `<description>${session.description}</description>`,
+        ...(session.status === "completed" || session.status === "error" || session.status === "cancelled"
+          ? [`<exit>${session.exit ?? "null"}</exit>`]
+          : []),
+        ...(session.error ? [`<error>${session.error}</error>`] : []),
+        ...(session.outputPath ? [`<output_path>${session.outputPath}</output_path>`] : []),
+        `<output>`,
+        head,
+        `</output>`,
+        `</shell_session>`,
+      ]
+      return {
+        title: session.description,
+        metadata: {
+          sessionId: session.id,
+          status: session.status,
+          exit: session.exit,
+          description: session.description,
+          truncated: session.truncated,
+          ...(session.outputPath ? { outputPath: session.outputPath } : {}),
+        },
+        output: lines.join("\n"),
       }
     })
 
@@ -611,14 +667,34 @@ export const ShellTool = Tool.define(
         const shell = Shell.acceptable(cfg.shell)
         const name = Shell.name(shell)
         const limits = yield* trunc.limits()
-        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs)
+        const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs, {
+          background: flags.experimentalBackgroundShell,
+        })
         yield* Effect.logInfo("shell tool using shell", { shell })
 
         return {
           description: prompt.description,
           parameters: prompt.parameters,
+          jsonSchema: flags.experimentalBackgroundShell
+            ? undefined
+            : ToolJsonSchema.fromSchema(ShellPrompt.BaseParameters as never),
           execute: (params: Parameters, ctx: Tool.Context) =>
             Effect.gen(function* () {
+              if (params.session_id) {
+                if (params.background === true) {
+                  return yield* Effect.fail(
+                    new Error("Cannot combine session_id (view) with background=true (start)"),
+                  )
+                }
+                return (yield* viewSession(params.session_id)) as ShellExecuteResult
+              }
+
+              if (params.background === true && !flags.experimentalBackgroundShell) {
+                return yield* Effect.fail(
+                  new Error("Background shell requires OPENCODE_EXPERIMENTAL_BACKGROUND_SHELL=true"),
+                )
+              }
+
               const instanceCtx = yield* InstanceState.context
               const cwd = params.workdir
                 ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
@@ -639,18 +715,129 @@ export const ShellTool = Tool.define(
                 }),
               )
 
-              return yield* run(
-                {
-                  shell,
+              const env = yield* shellEnv(ctx, cwd)
+
+              if (params.background !== true) {
+                const result = yield* run(
+                  {
+                    shell,
+                    command: params.command,
+                    cwd,
+                    env,
+                    timeout,
+                    description: params.description,
+                  },
+                  ctx,
+                )
+                return {
+                  title: params.description,
+                  metadata: {
+                    output: result.preview,
+                    exit: result.exit,
+                    description: params.description,
+                    truncated: result.truncated,
+                    ...(result.outputPath ? { outputPath: result.outputPath } : {}),
+                  },
+                  output: result.output,
+                } as ShellExecuteResult
+              }
+
+              const sessionId = `shell_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+              const initial = yield* sessions.create({
+                id: sessionId,
+                command: params.command,
+                description: params.description,
+                cwd,
+                workdir: params.workdir,
+              })
+
+              // Background commands must survive the original tool call's abort signal,
+              // so use a never-aborting signal here. Cancellation flows through
+              // BackgroundJob.cancel instead, keyed by the returned sessionId.
+              const backgroundAbort = new AbortController().signal
+              const result = yield* background.start({
+                id: sessionId,
+                type: "bash",
+                title: params.description,
+                metadata: {
+                  parentSessionId: ctx.sessionID,
+                  sessionId,
                   command: params.command,
-                  cwd,
-                  env: yield* shellEnv(ctx, cwd),
-                  timeout,
-                  description: params.description,
+                  workdir: params.workdir,
                 },
-                ctx,
-              )
-            }),
+                run: run(
+                  {
+                    shell,
+                    command: params.command,
+                    cwd,
+                    env,
+                    timeout,
+                    description: params.description,
+                  },
+                  ctx,
+                  {
+                    abort: backgroundAbort,
+                    onChunk: ({ output, description }) =>
+                      sessions.update(sessionId, { output, description }).pipe(Effect.asVoid),
+                  },
+                ).pipe(
+                  Effect.matchCauseEffect({
+                    onSuccess: (res) =>
+                      Effect.gen(function* () {
+                        yield* sessions.update(sessionId, {
+                          status: res.exit !== null ? "completed" : "error",
+                          output: res.preview,
+                          exit: res.exit,
+                          truncated: res.truncated,
+                          ...(res.outputPath ? { outputPath: res.outputPath } : {}),
+                          completedAt: Date.now(),
+                        })
+                        return res.output
+                      }),
+                    onFailure: (cause) =>
+                      Effect.gen(function* () {
+                        const isInterrupt = Cause.hasInterruptsOnly(cause)
+                        yield* sessions.update(sessionId, {
+                          status: isInterrupt ? "cancelled" : "error",
+                          error: Cause.pretty(cause),
+                          completedAt: Date.now(),
+                        })
+                        return yield* Effect.failCause(cause)
+                      }),
+                  }),
+                ),
+              })
+
+              // If the job settled before start() returned, surface the final state
+              // inline so the first tool call already shows completion.
+              const final = (yield* sessions.get(sessionId)) ?? initial
+              const summary = final.status === "running" ? "Background shell started" : "Background shell completed"
+              const lines = [
+                `<shell_session id="${final.id}" status="${final.status}">`,
+                `<command>${final.command}</command>`,
+                `<description>${final.description}</description>`,
+                ...(final.workdir ? [`<workdir>${final.workdir}</workdir>`] : []),
+                ...(final.status !== "running"
+                  ? [`<exit>${final.exit ?? "null"}</exit>`]
+                  : [`<note>Use session_id="${final.id}" to view the current output and progress of this background shell command.</note>`]),
+                ...(final.error ? [`<error>${final.error}</error>`] : []),
+                ...(final.outputPath ? [`<output_path>${final.outputPath}</output_path>`] : []),
+                ...(final.status === "running" ? [`<output>${final.output || "(no output yet)"}</output>`] : []),
+                `</shell_session>`,
+              ]
+              return {
+                title: params.description,
+                metadata: {
+                  sessionId: result.id,
+                  status: final.status,
+                  description: params.description,
+                  truncated: final.truncated,
+                  ...(final.outputPath ? { outputPath: final.outputPath } : {}),
+                  ...(final.status !== "running" ? { exit: final.exit } : {}),
+                },
+                output: [summary, ...lines].join("\n"),
+              } as ShellExecuteResult
+            }).pipe(Effect.orDie),
         }
       })
   }),

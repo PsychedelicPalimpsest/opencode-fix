@@ -92,6 +92,25 @@ describe("tool.registry", () => {
     }),
   )
 
+  it.instance("hides bash background and session_id parameters unless experimental background shell is enabled", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agent = yield* Agent.Service
+      const build = yield* agent.get("build")
+      if (!build) throw new Error("build agent not found")
+      const bash = (yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+      })).find((tool) => tool.id === "bash")
+
+      expect(bash?.jsonSchema).toBeDefined()
+      const properties = bash?.jsonSchema?.properties as Record<string, unknown> | undefined
+      expect(properties?.background).toBeUndefined()
+      expect(properties?.session_id).toBeUndefined()
+    }),
+  )
+
   it.instance("loads tools from .opencode/tool (singular)", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
