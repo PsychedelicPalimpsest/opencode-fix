@@ -29,7 +29,7 @@ export const ShellBackgroundTool = Tool.define(
     const flags = yield* RuntimeFlags.Service
     const background = yield* BackgroundJob.Service
     const sessions = yield* ShellSessions.Service
-    const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
+    const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? Infinity
 
     const viewSession = Effect.fn("ShellBackgroundTool.view")(function* (id: string) {
       const session = yield* sessions.get(id)
