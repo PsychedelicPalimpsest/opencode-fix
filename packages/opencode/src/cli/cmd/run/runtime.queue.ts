@@ -10,7 +10,7 @@
 // Resolves when the footer closes and all in-flight work finishes.
 import * as Locale from "@/util/locale"
 import { MessageID, PartID } from "@/session/schema"
-import { isExitCommand, isNewCommand } from "./prompt.shared"
+import { isExitCommand, isNewCommand, isQueueCommand, parseQueueCommand } from "./prompt.shared"
 import type { FooterApi, FooterEvent, FooterQueuedPrompt, RunPrompt } from "./types"
 
 type Trace = {
@@ -35,6 +35,7 @@ export type QueueInput = {
 type State = {
   queue: RunPrompt[]
   queued: FooterQueuedPrompt[]
+  deferred: FooterQueuedPrompt[]
   active?: RunPrompt
   ctrl?: AbortController
   closed: boolean
@@ -62,6 +63,7 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
   const state: State = {
     queue: [],
     queued: [],
+    deferred: [],
     closed: input.footer.isClosed,
   }
   let draining: Promise<void> | undefined
@@ -74,19 +76,14 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
   const syncQueue = () => {
     const queue = state.queue.length
     emit({ type: "queue", queue }, { queue })
+    const allQueued = [...state.queued, ...state.deferred]
     emit(
       {
         type: "queued.prompts",
-        prompts: [...state.queued],
+        prompts: allQueued,
       },
-      { queued: state.queued.length },
+      { queued: allQueued.length },
     )
-  }
-
-  const removeLocalQueued = (queued: FooterQueuedPrompt) => {
-    if (!state.queued.includes(queued)) return
-    state.queued = state.queued.filter((item) => item !== queued)
-    syncQueue()
   }
 
   const finish = () => {
@@ -105,26 +102,36 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
     state.closed = true
     state.queue.length = 0
     state.queued.length = 0
+    state.deferred.length = 0
     state.ctrl?.abort()
     stop.resolve({ type: "closed" })
     finish()
   }
 
   const drain = () => {
-    if (draining || state.closed || state.queue.length === 0) {
+    if (draining || state.closed || (state.queue.length === 0 && state.deferred.length === 0)) {
       return
     }
 
     draining = (async () => {
       try {
-        while (!state.closed && state.queue.length > 0) {
+        while (!state.closed && (state.queue.length > 0 || state.deferred.length > 0)) {
+          if (state.queue.length === 0 && state.deferred.length > 0) {
+            const next = state.deferred.shift()
+            if (next) state.queue.push(next.prompt)
+          }
           const prompt = state.queue.shift()
           if (!prompt) {
             continue
           }
 
-          const queued = state.queued.find((item) => item.prompt === prompt)
-          if (queued) removeLocalQueued(queued)
+          const allQueued = [...state.queued, ...state.deferred]
+          const queued = allQueued.find((item) => item.prompt === prompt)
+          if (queued) {
+            state.queued = state.queued.filter((item) => item !== queued)
+            state.deferred = state.deferred.filter((item) => item !== queued)
+            syncQueue()
+          }
 
           if (prompt.mode !== "shell" && isNewCommand(prompt.text)) {
             syncQueue()
@@ -275,6 +282,21 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
       return
     }
 
+    if (prompt.mode !== "shell" && isQueueCommand(prompt.text)) {
+      const queuedText = parseQueueCommand(prompt.text)
+      if (!queuedText) return
+      const deferredPrompt: RunPrompt = { text: queuedText, parts: [] }
+      const deferred: FooterQueuedPrompt = {
+        messageID: MessageID.ascending(),
+        partID: PartID.ascending(),
+        prompt: deferredPrompt,
+      }
+      state.deferred = [...state.deferred, deferred]
+      syncQueue()
+      drain()
+      return
+    }
+
     const active = state.active
     if (
       active &&
@@ -322,10 +344,19 @@ export async function runPromptQueue(input: QueueInput): Promise<void> {
   })
   const offRemoveQueued = input.footer.onQueuedRemove((messageID) => {
     const queued = state.queued.find((item) => item.messageID === messageID)
-    if (!queued) return false
-    state.queue = state.queue.filter((prompt) => prompt !== queued.prompt)
-    removeLocalQueued(queued)
-    return true
+    if (queued) {
+      state.queue = state.queue.filter((prompt) => prompt !== queued.prompt)
+      state.queued = state.queued.filter((item) => item !== queued)
+      syncQueue()
+      return true
+    }
+    const deferred = state.deferred.find((item) => item.messageID === messageID)
+    if (deferred) {
+      state.deferred = state.deferred.filter((item) => item !== deferred)
+      syncQueue()
+      return true
+    }
+    return false
   })
 
   try {

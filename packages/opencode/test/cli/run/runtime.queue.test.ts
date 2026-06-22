@@ -478,4 +478,293 @@ describe("run runtime queue", () => {
     ui.submit("one")
     await expect(task).rejects.toThrow("boom")
   })
+
+  test("/queue with no arguments is a no-op", async () => {
+    const ui = footer()
+    let calls = 0
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async () => {
+        calls += 1
+        ui.api.close()
+      },
+    })
+
+    ui.submit("/queue ")
+    ui.api.close()
+    await task
+
+    expect(calls).toBe(0)
+  })
+
+  test("/queue prompt runs immediately when idle", async () => {
+    const ui = footer()
+    const seen: string[] = []
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async (input) => {
+        seen.push(input.text)
+        ui.api.close()
+      },
+    })
+
+    ui.submit("/queue do thing")
+    await task
+
+    expect(seen).toEqual(["do thing"])
+    expect(ui.commits).toEqual([
+      {
+        kind: "user",
+        text: "do thing",
+        phase: "start",
+        source: "system",
+        messageID: expect.any(String),
+      },
+    ])
+  })
+
+  test("/queue prompt runs after active turn finishes", async () => {
+    const ui = footer()
+    const seen: string[] = []
+    let wake: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      wake = resolve
+    })
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async (input) => {
+        seen.push(input.text)
+        if (seen.length === 2) {
+          ui.api.close()
+          return
+        }
+        if (seen.length === 1) {
+          await gate
+        }
+      },
+    })
+
+    ui.submit("first")
+    await Promise.resolve()
+    expect(seen).toEqual(["first"])
+
+    ui.submit("/queue deferred task")
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(seen).toEqual(["first"])
+
+    wake?.()
+    await task
+
+    expect(seen).toEqual(["first", "deferred task"])
+  })
+
+  test("multiple /queue prompts run in FIFO order", async () => {
+    const ui = footer()
+    const seen: string[] = []
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async (input) => {
+        seen.push(input.text)
+        if (seen.length === 3) {
+          ui.api.close()
+        }
+      },
+    })
+
+    ui.submit("/queue alpha")
+    ui.submit("/queue beta")
+    ui.submit("/queue gamma")
+    await task
+
+    expect(seen).toEqual(["alpha", "beta", "gamma"])
+  })
+
+  test("/queue prompts and auto-queued prompts interleave", async () => {
+    const ui = footer()
+    const seen: string[] = []
+    let wake: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      wake = resolve
+    })
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async (input) => {
+        seen.push(input.text)
+        if (seen.length === 1) {
+          await gate
+          return
+        }
+        if (seen.length === 3) {
+          ui.api.close()
+        }
+      },
+    })
+
+    ui.submit("active")
+    await Promise.resolve()
+    expect(seen).toEqual(["active"])
+
+    ui.submit("/queue deferred-a")
+    ui.submit("auto-queued")
+    await Promise.resolve()
+    await Promise.resolve()
+
+    wake?.()
+    await task
+
+    expect(seen).toEqual(["active", "auto-queued", "deferred-a"])
+  })
+
+  test("deferred prompts appear in queued.prompts events", async () => {
+    const ui = footer()
+    let wake: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      wake = resolve
+    })
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async () => {
+        await gate
+      },
+    })
+
+    ui.submit("/queue future work")
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const event = ui.events.findLast((item) => item.type === "queued.prompts")
+    expect(event?.type === "queued.prompts" ? event.prompts.length : 0).toBe(1)
+    expect(
+      event?.type === "queued.prompts" ? event.prompts[0]!.prompt.text : "",
+    ).toBe("future work")
+
+    wake?.()
+    ui.api.close()
+    await task
+  })
+
+  test("removing a deferred prompt skips it", async () => {
+    const ui = footer()
+    const seen: string[] = []
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async (input) => {
+        seen.push(input.text)
+        if (seen.length === 2) {
+          ui.api.close()
+        }
+      },
+    })
+
+    ui.submit("/queue keep")
+    ui.submit("/queue remove-me")
+    ui.submit("/queue also-keep")
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const event = ui.events.findLast((item) => item.type === "queued.prompts")
+    if (event?.type === "queued.prompts") {
+      const removed = event.prompts.find((item) => item.prompt.text === "remove-me")
+      if (removed) ui.removeQueued(removed.messageID)
+    }
+
+    await task
+
+    expect(seen).toEqual(["keep", "also-keep"])
+  })
+
+  test("close aborts active run and drops deferred queue", async () => {
+    const ui = footer()
+    const seen: string[] = []
+    let hit = false
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async (_input, signal) => {
+        seen.push(_input.text)
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            hit = true
+            resolve()
+            return
+          }
+          signal.addEventListener("abort", () => {
+            hit = true
+            resolve()
+          }, { once: true })
+        })
+      },
+    })
+
+    ui.submit("active")
+    await Promise.resolve()
+    ui.submit("/queue never-runs")
+    ui.api.close()
+    await task
+
+    expect(hit).toBe(true)
+    expect(seen).toEqual(["active"])
+  })
+
+  test("/queue prompt survives a normal turn completing", async () => {
+    const ui = footer()
+    const seen: string[] = []
+    let wake: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      wake = resolve
+    })
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async (input) => {
+        seen.push(input.text)
+        if (seen.length === 1) {
+          await gate
+        }
+        if (seen.length === 2) {
+          ui.api.close()
+        }
+      },
+    })
+
+    ui.submit("/queue first-deferred")
+    await Promise.resolve()
+    ui.submit("/queue second-deferred")
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(seen).toEqual(["first-deferred"])
+
+    wake?.()
+    await task
+
+    expect(seen).toEqual(["first-deferred", "second-deferred"])
+  })
+
+  test("shell-mode /queue is treated as a shell command", async () => {
+    const ui = footer()
+    const seen: RunPrompt[] = []
+
+    const task = runPromptQueue({
+      footer: ui.api,
+      run: async (input) => {
+        seen.push(input)
+        ui.api.close()
+      },
+    })
+
+    ui.submit("/queue do shell work", "shell")
+    await task
+
+    expect(seen).toEqual([{ text: "/queue do shell work", parts: [], mode: "shell" }])
+    expect(ui.commits).toEqual([])
+  })
 })

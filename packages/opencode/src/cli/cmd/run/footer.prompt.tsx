@@ -18,6 +18,7 @@ import {
   displayCharAt,
   displaySlice,
   isExitCommand,
+  isQueueCommand,
   mentionTriggerIndex,
   isNewCommand,
   movePromptHistory,
@@ -1186,7 +1187,7 @@ export function createPromptState(input: PromptInput): PromptState {
     }
 
     const parsed =
-      command || next.mode === "shell" || isNewCommand(next.text)
+      command || next.mode === "shell" || isNewCommand(next.text) || isQueueCommand(next.text)
         ? undefined
         : parseSlashCommand(next.text, input.commands())
     if (parsed?.type === "pending") {

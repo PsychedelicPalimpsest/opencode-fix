@@ -52,6 +52,18 @@ export function isNewCommand(input: string): boolean {
   return input.trim().toLowerCase() === "/new"
 }
 
+export function isQueueCommand(input: string): boolean {
+  return input.trim().toLowerCase().startsWith("/queue ")
+}
+
+export function parseQueueCommand(input: string): string | undefined {
+  if (!isQueueCommand(input)) return undefined
+  const text = input.trim()
+  const spaceIndex = text.indexOf(" ")
+  const rest = text.slice(spaceIndex + 1).trim()
+  return rest || undefined
+}
+
 export function createPromptHistory(items?: RunPrompt[]): PromptHistoryState {
   const list = (items ?? []).filter((item) => item.text.trim().length > 0).map(promptCopy)
   const next: RunPrompt[] = []
