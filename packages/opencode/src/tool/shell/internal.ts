@@ -1,0 +1,642 @@
+import { Effect, Stream } from "effect"
+import { createWriteStream } from "node:fs"
+import path from "path"
+import { Language, type Node } from "web-tree-sitter"
+import { containsPath, type InstanceContext } from "../../project/instance-context"
+import { lazy } from "@/util/lazy"
+import { fileURLToPath } from "url"
+import { Shell } from "@opencode-ai/core/shell"
+import { ShellID } from "./id"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Config } from "@/config/config"
+import { Plugin } from "@/plugin"
+import { Truncate } from "@/tool/truncate"
+import { ChildProcess } from "effect/unstable/process"
+import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+import { BashArity } from "@/permission/arity"
+import type * as Tool from "@/tool/tool"
+import * as PermissionV1 from "@opencode-ai/core/v1/permission"
+
+export const MAX_METADATA_LENGTH = 30_000
+
+const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
+const FILES = new Set([
+  ...CWD,
+  "rm",
+  "cp",
+  "mv",
+  "mkdir",
+  "touch",
+  "chmod",
+  "chown",
+  "cat",
+  "get-content",
+  "set-content",
+  "add-content",
+  "copy-item",
+  "move-item",
+  "remove-item",
+  "new-item",
+  "rename-item",
+])
+const CMD_FILES = new Set([
+  "copy",
+  "del",
+  "dir",
+  "erase",
+  "md",
+  "mkdir",
+  "move",
+  "rd",
+  "ren",
+  "rename",
+  "rmdir",
+  "type",
+])
+const FLAGS = new Set(["-destination", "-literalpath", "-path"])
+const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
+
+export type Part = {
+  type: string
+  text: string
+}
+
+export type Scan = {
+  dirs: Set<string>
+  patterns: Set<string>
+  always: Set<string>
+}
+
+export type Chunk = {
+  text: string
+  size: number
+}
+
+export type RunInput = {
+  shell: string
+  command: string
+  cwd: string
+  env: NodeJS.ProcessEnv
+  timeout: number
+  description: string
+}
+
+export type RunResult = {
+  output: string
+  preview: string
+  exit: number | null
+  truncated: boolean
+  outputPath: string | undefined
+}
+
+export type RunDeps = {
+  spawner: ChildProcessSpawner["Service"]
+  trunc: Truncate.Interface
+}
+
+export type RunOptions = {
+  abort?: AbortSignal
+  onChunk?: (input: { output: string; description: string }) => Effect.Effect<void>
+}
+
+function parts(node: Node) {
+  const out: Part[] = []
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i)
+    if (!child) continue
+    if (child.type === "command_elements") {
+      for (let j = 0; j < child.childCount; j++) {
+        const item = child.child(j)
+        if (!item || item.type === "command_argument_sep" || item.type === "redirection") continue
+        out.push({ type: item.type, text: item.text })
+      }
+      continue
+    }
+    if (
+      child.type !== "command_name" &&
+      child.type !== "command_name_expr" &&
+      child.type !== "word" &&
+      child.type !== "string" &&
+      child.type !== "raw_string" &&
+      child.type !== "concatenation"
+    ) {
+      continue
+    }
+    out.push({ type: child.type, text: child.text })
+  }
+  return out
+}
+
+function source(node: Node) {
+  return (node.parent?.type === "redirected_statement" ? node.parent.text : node.text).trim()
+}
+
+function commands(node: Node) {
+  return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
+}
+
+function unquote(text: string) {
+  if (text.length < 2) return text
+  const first = text[0]
+  const last = text[text.length - 1]
+  if ((first === '"' || first === "'") && first === last) return text.slice(1, -1)
+  return text
+}
+
+function home(text: string) {
+  if (text === "~") return os.homedir()
+  if (text.startsWith("~/") || text.startsWith("~\\")) return path.join(os.homedir(), text.slice(2))
+  return text
+}
+
+function envValue(key: string) {
+  if (process.platform !== "win32") return process.env[key]
+  const name = Object.keys(process.env).find((item) => item.toLowerCase() === key.toLowerCase())
+  return name ? process.env[name] : undefined
+}
+
+function auto(key: string, cwd: string, shell: string) {
+  const name = key.toUpperCase()
+  if (name === "HOME") return os.homedir()
+  if (name === "PWD") return cwd
+  if (name === "PSHOME") return path.dirname(shell)
+}
+
+function expand(text: string, cwd: string, shell: string) {
+  const out = unquote(text)
+    .replace(/\$\{env:([^}]+)\}/gi, (_, key: string) => envValue(key) || "")
+    .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (_, key: string) => envValue(key) || "")
+    .replace(/\$(HOME|PWD|PSHOME)(?=$|[\\/])/gi, (_, key: string) => auto(key, cwd, shell) || "")
+  return home(out)
+}
+
+function provider(text: string) {
+  const match = text.match(/^([A-Za-z]+)::(.*)$/)
+  if (match) {
+    if (match[1].toLowerCase() !== "filesystem") return
+    return match[2]
+  }
+  const prefix = text.match(/^([A-Za-z]+):(.*)$/)
+  if (!prefix) return text
+  if (prefix[1].length === 1) return text
+  return
+}
+
+function dynamic(text: string, ps: boolean) {
+  if (text.startsWith("(") || text.startsWith("@(")) return true
+  if (text.includes("$(") || text.includes("${") || text.includes("`")) return true
+  if (ps) return /\$(?!env:)/i.test(text)
+  return text.includes("$")
+}
+
+function prefix(text: string) {
+  const match = /[?*[]/.exec(text)
+  if (!match) return text
+  if (match.index === 0) return
+  return text.slice(0, match.index)
+}
+
+function pathArgs(list: Part[], ps: boolean, cmd = false) {
+  if (!ps) {
+    return list
+      .slice(1)
+      .filter(
+        (item) =>
+          !item.text.startsWith("-") &&
+          !(cmd && item.text.startsWith("/")) &&
+          !(list[0]?.text === "chmod" && item.text.startsWith("+")),
+      )
+      .map((item) => item.text)
+  }
+
+  const out: string[] = []
+  let want = false
+  for (const item of list.slice(1)) {
+    if (want) {
+      out.push(item.text)
+      want = false
+      continue
+    }
+    if (item.type === "command_parameter") {
+      const flag = item.text.toLowerCase()
+      if (SWITCHES.has(flag)) continue
+      want = FLAGS.has(flag)
+      continue
+    }
+    out.push(item.text)
+  }
+  return out
+}
+
+function preview(text: string) {
+  if (text.length <= MAX_METADATA_LENGTH) return text
+  return "...\n\n" + text.slice(-MAX_METADATA_LENGTH)
+}
+
+function tail(text: string, maxLines: number, maxBytes: number) {
+  const lines = text.split("\n")
+  if (lines.length <= maxLines && Buffer.byteLength(text, "utf-8") <= maxBytes) {
+    return {
+      text,
+      cut: false,
+    }
+  }
+
+  const out: string[] = []
+  let bytes = 0
+  for (let i = lines.length - 1; i >= 0 && out.length < maxLines; i--) {
+    const size = Buffer.byteLength(lines[i], "utf-8") + (out.length > 0 ? 1 : 0)
+    if (bytes + size > maxBytes) {
+      if (out.length === 0) {
+        const buf = Buffer.from(lines[i], "utf-8")
+        let start = buf.length - maxBytes
+        if (start < 0) start = 0
+        while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++
+        out.unshift(buf.subarray(start).toString("utf-8"))
+      }
+      break
+    }
+    out.unshift(lines[i])
+    bytes += size
+  }
+  return {
+    text: out.join("\n"),
+    cut: true,
+  }
+}
+
+const resolveWasm = (asset: string) => {
+  if (asset.startsWith("file://")) return fileURLToPath(asset)
+  if (asset.startsWith("/") || /^[a-z]:/i.test(asset)) return asset
+  const url = new URL(asset, import.meta.url)
+  return fileURLToPath(url)
+}
+
+const parser = lazy(async () => {
+  const { Parser } = await import("web-tree-sitter")
+  const { default: treeWasm } = await import("web-tree-sitter/tree-sitter.wasm" as string, {
+    with: { type: "wasm" },
+  })
+  const treePath = resolveWasm(treeWasm)
+  await Parser.init({
+    locateFile() {
+      return treePath
+    },
+  })
+  const { default: bashWasm } = await import("tree-sitter-bash/tree-sitter-bash.wasm" as string, {
+    with: { type: "wasm" },
+  })
+  const { default: psWasm } = await import("tree-sitter-powershell/tree-sitter-powershell.wasm" as string, {
+    with: { type: "wasm" },
+  })
+  const bashPath = resolveWasm(bashWasm)
+  const psPath = resolveWasm(psWasm)
+  const [bashLanguage, psLanguage] = await Promise.all([Language.load(bashPath), Language.load(psPath)])
+  const bash = new Parser()
+  bash.setLanguage(bashLanguage)
+  const ps = new Parser()
+  ps.setLanguage(psLanguage)
+  return { bash, ps }
+})
+
+export const parse = Effect.fn("ShellToolShared.parse")(function* (command: string, ps: boolean) {
+  const tree = yield* Effect.promise(() => parser().then((p) => (ps ? p.ps : p.bash).parse(command)))
+  if (!tree) throw new Error("Failed to parse command")
+  return tree
+})
+
+function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
+  if (process.platform === "win32" && Shell.ps(shell)) {
+    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
+      cwd,
+      env,
+      stdin: "ignore",
+      detached: false,
+    })
+  }
+
+  return ChildProcess.make(command, [], {
+    shell,
+    cwd,
+    env,
+    stdin: "ignore",
+    detached: process.platform !== "win32",
+  })
+}
+
+export const resolvePath = Effect.fn("ShellToolShared.resolvePath")(function* (
+  text: string,
+  root: string,
+  shell: string,
+  spawner: ChildProcessSpawner["Service"],
+) {
+  if (process.platform === "win32") {
+    if (Shell.posix(shell) && text.startsWith("/") && FSUtil.windowsPath(text) === text) {
+      const lines = yield* spawner
+        .lines(ChildProcess.make(shell, ["-lc", 'cygpath -w -- "$1"', "_", text]))
+        .pipe(Effect.catch(() => Effect.succeed([] as string[])))
+      const file = lines[0]?.trim()
+      if (file) return FSUtil.normalizePath(file)
+    }
+    return FSUtil.normalizePath(path.resolve(root, FSUtil.windowsPath(text)))
+  }
+  return path.resolve(root, text)
+})
+
+export const shellEnv = Effect.fn("ShellToolShared.shellEnv")(function* (
+  ctx: Tool.Context,
+  cwd: string,
+  plugin: Plugin.Interface,
+) {
+  const extra = yield* plugin.trigger(
+    "shell.env",
+    { cwd, sessionID: ctx.sessionID, callID: ctx.callID },
+    { env: {} },
+  )
+  return {
+    ...process.env,
+    ...extra.env,
+  }
+})
+
+export const ask = Effect.fn("ShellToolShared.ask")(function* (
+  ctx: Tool.Context,
+  scan: Scan,
+  input: { command: string; description: string },
+) {
+  if (scan.dirs.size > 0) {
+    const directories = Array.from(scan.dirs)
+    const globs = directories.map((dir) => {
+      if (process.platform === "win32") return FSUtil.normalizePathPattern(path.join(dir, "*"))
+      return path.join(dir, "*")
+    })
+    yield* ctx.ask({
+      permission: "external_directory",
+      patterns: globs,
+      always: globs,
+      metadata: {
+        command: input.command,
+        description: input.description,
+        directories,
+        patterns: globs,
+      },
+    })
+  }
+
+  if (scan.patterns.size === 0) return
+  yield* ctx.ask({
+    permission: ShellID.ToolID,
+    patterns: Array.from(scan.patterns),
+    always: Array.from(scan.always),
+    metadata: {
+      command: input.command,
+      description: input.description,
+    },
+  })
+})
+
+export type CollectDeps = {
+  fs: FSUtil.Interface
+  spawner: ChildProcessSpawner["Service"]
+}
+
+export const collect = Effect.fn("ShellToolShared.collect")(function* (
+  root: Node,
+  cwd: string,
+  ps: boolean,
+  shell: string,
+  instance: InstanceContext,
+  deps: CollectDeps,
+) {
+  const { fs, spawner } = deps
+  const scan: Scan = {
+    dirs: new Set<string>(),
+    patterns: new Set<string>(),
+    always: new Set<string>(),
+  }
+  const shellKind = ShellID.toKind(Shell.name(shell))
+
+  const cygpath = Effect.fnUntraced(function* (text: string) {
+    const lines = yield* spawner
+      .lines(ChildProcess.make(shell, ["-lc", 'cygpath -w -- "$1"', "_", text]))
+      .pipe(Effect.catch(() => Effect.succeed([] as string[])))
+    const file = lines[0]?.trim()
+    if (!file) return
+    return FSUtil.normalizePath(file)
+  })
+
+  const resolvePath = Effect.fnUntraced(function* (text: string, root: string) {
+    if (process.platform === "win32") {
+      if (Shell.posix(shell) && text.startsWith("/") && FSUtil.windowsPath(text) === text) {
+        const file = yield* cygpath(text)
+        if (file) return file
+      }
+      return FSUtil.normalizePath(path.resolve(root, FSUtil.windowsPath(text)))
+    }
+    return path.resolve(root, text)
+  })
+
+  const argPath = Effect.fnUntraced(function* (arg: string) {
+    const text = ps ? expand(arg, cwd, shell) : home(unquote(arg))
+    const file = text && prefix(text)
+    if (!file || dynamic(file, ps)) return
+    const next = ps ? provider(file) : file
+    if (!next) return
+    return yield* resolvePath(next, cwd)
+  })
+
+  for (const node of commands(root)) {
+    const command = parts(node)
+    const tokens = command.map((item) => item.text)
+    const cmdName = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
+
+    if (cmdName && (FILES.has(cmdName) || (shellKind === "cmd" && CMD_FILES.has(cmdName)))) {
+      for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
+        const resolved = yield* argPath(arg)
+        yield* Effect.logInfo("resolved path", { arg, resolved })
+        if (!resolved || containsPath(resolved, instance)) continue
+        const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
+        scan.dirs.add(dir)
+      }
+    }
+
+    if (tokens.length && (!cmdName || !CWD.has(cmdName))) {
+      scan.patterns.add(source(node))
+      scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
+    }
+  }
+
+  return scan
+})
+
+export const run = Effect.fn("ShellToolShared.run")(function* (
+  input: RunInput,
+  ctx: Tool.Context,
+  deps: RunDeps,
+  options: RunOptions = {},
+) {
+  const { spawner, trunc } = deps
+  const streamUpdate =
+    options.onChunk ??
+    ((p) => ctx.metadata({ metadata: { output: p.output, description: p.description } }))
+  const limits = yield* trunc.limits()
+  const keep = limits.maxBytes * 2
+  let full = ""
+  let last = ""
+  const list: Chunk[] = []
+  let used = 0
+  let file = ""
+  let sink: ReturnType<typeof createWriteStream> | undefined
+  let cut = false
+  let expired = false
+  let aborted = false
+
+  const closeSink = Effect.fnUntraced(function* () {
+    const stream = sink
+    if (!stream) return
+    sink = undefined
+    if (stream.destroyed || stream.closed) return
+    yield* Effect.promise(
+      () =>
+        new Promise<void>((resolve) => {
+          let settled = false
+          const done = () => {
+            if (settled) return
+            settled = true
+            stream.off("close", done)
+            stream.off("error", done)
+            stream.off("finish", done)
+            resolve()
+          }
+          stream.once("close", done)
+          stream.once("error", done)
+          stream.once("finish", done)
+          stream.end(done)
+        }),
+    ).pipe(Effect.catch(() => Effect.void))
+  })
+
+  yield* streamUpdate({
+    output: "",
+    description: input.description,
+  })
+
+  const code: number | null = yield* Effect.scoped(
+    Effect.gen(function* () {
+      yield* Effect.addFinalizer(closeSink)
+      const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+
+      yield* Effect.forkScoped(
+        Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+          const size = Buffer.byteLength(chunk, "utf-8")
+          list.push({ text: chunk, size })
+          used += size
+          while (used > keep && list.length > 1) {
+            const item = list.shift()
+            if (!item) break
+            used -= item.size
+            cut = true
+          }
+
+          last = preview(last + chunk)
+
+          if (file) {
+            sink?.write(chunk)
+          } else {
+            full += chunk
+            if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+              return trunc.write(full).pipe(
+                Effect.andThen((next) =>
+                  Effect.sync(() => {
+                    file = next
+                    cut = true
+                    sink = createWriteStream(next, { flags: "a" })
+                    full = ""
+                  }),
+                ),
+                Effect.andThen(
+                  streamUpdate({
+                    output: last,
+                    description: input.description,
+                  }),
+                ),
+              )
+            }
+          }
+
+          return streamUpdate({
+            output: last,
+            description: input.description,
+          })
+        }),
+      )
+
+      const abort = Effect.callback<void>((resume) => {
+        const signal = options.abort ?? ctx.abort
+        if (signal.aborted) return resume(Effect.void)
+        const handler = () => resume(Effect.void)
+        signal.addEventListener("abort", handler, { once: true })
+        return Effect.sync(() => signal.removeEventListener("abort", handler))
+      })
+
+      const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+
+      const exit = yield* Effect.raceAll([
+        handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+        abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+        timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+      ])
+
+      if (exit.kind === "abort") {
+        aborted = true
+        yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+      }
+      if (exit.kind === "timeout") {
+        expired = true
+        yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+      }
+
+      return exit.kind === "exit" ? exit.code : null
+    }),
+  ).pipe(Effect.orDie)
+
+  const meta: string[] = []
+  if (expired) {
+    meta.push(
+      `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
+    )
+  }
+  if (aborted) meta.push("User aborted the command")
+  const raw = list.map((item) => item.text).join("")
+  const end = tail(raw, limits.maxLines, limits.maxBytes)
+  if (end.cut) cut = true
+  if (!file && end.cut) {
+    file = yield* trunc.write(raw)
+  }
+
+  let output = end.text
+  if (!output) output = "(no output)"
+
+  if (cut && file) {
+    output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
+  }
+
+  if (meta.length > 0) {
+    output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
+  }
+  return {
+    output,
+    preview: last || preview(output),
+    exit: code,
+    truncated: cut,
+    outputPath: cut && file ? file : undefined,
+  }
+})
+
+export type ForegroundDeps = {
+  config: Config.Service
+  spawner: ChildProcessSpawner["Service"]
+  trunc: Truncate.Interface
+}
+
+import os from "os"

@@ -30,28 +30,7 @@ export function parameterSchema(description: string) {
   })
 }
 
-export const BaseParameterFields = {
-  command: Schema.String.annotate({ description: "The command to execute" }),
-  timeout: Schema.optional(PositiveInt).annotate({ description: "Optional timeout in milliseconds" }),
-  workdir: Schema.optional(Schema.String).annotate({
-    description: `The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands.`,
-  }),
-  description: Schema.String.annotate({ description: descriptions.bash }),
-}
-
-export const BaseParameters = Schema.Struct(BaseParameterFields)
-
-export const Parameters = Schema.Struct({
-  ...BaseParameterFields,
-  background: Schema.optional(Schema.Boolean).annotate({
-    description:
-      "Run the command in the background. The tool returns a session_id you can pass back to view the current output and progress of the shell command. DO NOT sleep, poll, or proactively check on its progress",
-  }),
-  session_id: Schema.optional(Schema.String).annotate({
-    description:
-      "The id of a backgrounded shell command to view. Returns the current output and status without waiting. Combine with background=false (default) to read the latest progress of a previously started background command.",
-  }),
-})
+export const Parameters = parameterSchema(descriptions.bash)
 export type Parameters = Schema.Schema.Type<typeof Parameters>
 
 function renderPrompt(template: string, values: Record<string, string>) {
@@ -305,38 +284,52 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   }
 }
 
+export function render(name: string, platform: NodeJS.Platform, limits: Limits, defaultTimeoutMs: number) {
+  const selected = profile(name, platform, limits, defaultTimeoutMs)
+  return {
+    description: renderPrompt(DESCRIPTION, {
+      intro: selected.intro,
+      os: platform,
+      shell: name,
+      tmp: Global.Path.tmp,
+      workdirSection: selected.workdirSection,
+      commandSection: selected.commandSection,
+      gitCommands: selected.gitCommands,
+      toolName: ShellID.ToolID,
+      gitCommandRestriction: selected.gitCommandRestriction,
+      createPrInstruction: selected.createPrInstruction,
+      createPrExample: selected.createPrExample,
+    }),
+    parameters: parameterSchema(selected.parameterDescription),
+  }
+}
+
 export const BACKGROUND_DESCRIPTION = [
-  "Background mode: background=true launches the shell command asynchronously and returns a session_id immediately.",
-  "Foreground is the default; use it when you need the result before continuing.",
-  "Use background only for commands that can run while you continue elsewhere (long builds, servers, watchers, long file operations).",
-  "Pass the returned session_id back to this tool to view the current output and progress of a backgrounded command.",
+  "Run a shell command asynchronously. This tool returns a session_id immediately so you can continue working while the command runs.",
+  "Foreground is the default (`bash`); use `bash_background` for long-running commands, watchers, servers, or any work that does not need to complete before you continue.",
+  "Pass the same session_id back to this tool to view the current output and progress of the background command — combine with no other arguments.",
   "You will be notified automatically when the command finishes.",
 ].join(" ")
 
-export function render(
-  name: string,
-  platform: NodeJS.Platform,
-  limits: Limits,
-  defaultTimeoutMs: number,
-  options: { background: boolean } = { background: false },
-) {
-  const selected = profile(name, platform, limits, defaultTimeoutMs)
-  const description = renderPrompt(DESCRIPTION, {
-    intro: selected.intro,
-    os: platform,
-    shell: name,
-    tmp: Global.Path.tmp,
-    workdirSection: selected.workdirSection,
-    commandSection: selected.commandSection,
-    gitCommands: selected.gitCommands,
-    toolName: ShellID.ToolID,
-    gitCommandRestriction: selected.gitCommandRestriction,
-    createPrInstruction: selected.createPrInstruction,
-    createPrExample: selected.createPrExample,
-  })
+export const BackgroundParameters = Schema.Struct({
+  command: Schema.optional(Schema.String).annotate({ description: "The command to execute asynchronously" }),
+  description: Schema.optional(Schema.String).annotate({ description: descriptions.bash }),
+  timeout: Schema.optional(PositiveInt).annotate({ description: "Optional timeout in milliseconds" }),
+  workdir: Schema.optional(Schema.String).annotate({
+    description: `The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands.`,
+  }),
+  session_id: Schema.optional(Schema.String).annotate({
+    description:
+      "The id of a background shell session to view. When provided, the tool returns the current output and status of that session instead of starting a new command.",
+  }),
+})
+export type BackgroundParameters = Schema.Schema.Type<typeof BackgroundParameters>
+
+export function renderBackground(name: string, platform: NodeJS.Platform) {
+  const selected = profile(name, platform, { maxLines: 0, maxBytes: 0 }, 0)
   return {
-    description: options.background ? [description, BACKGROUND_DESCRIPTION].join("\n\n") : description,
-    parameters: Parameters,
+    description: BACKGROUND_DESCRIPTION,
+    parameters: BackgroundParameters,
   }
 }
 

@@ -16,4 +16,7 @@ export function toKind(value: string): Kind {
 export const ToolID = "bash"
 export type ToolID = typeof ToolID
 
+export const BackgroundToolID = "bash_background"
+export type BackgroundToolID = typeof BackgroundToolID
+
 export * as ShellID from "./id"

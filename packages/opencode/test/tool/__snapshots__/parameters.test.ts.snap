@@ -61,16 +61,12 @@ Output: Creates directory 'foo'"
 }
 `;
 
-exports[`tool parameters JSON Schema (wire shape) bash (background) 1`] = `
+exports[`tool parameters JSON Schema (wire shape) bash_background 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
-    "background": {
-      "description": "Run the command in the background. The tool returns a session_id you can pass back to view the current output and progress of the shell command. DO NOT sleep, poll, or proactively check on its progress",
-      "type": "boolean",
-    },
     "command": {
-      "description": "The command to execute",
+      "description": "The command to execute asynchronously",
       "type": "string",
     },
     "description": {
@@ -91,7 +87,7 @@ Output: Creates directory 'foo'"
       "type": "string",
     },
     "session_id": {
-      "description": "The id of a backgrounded shell command to view. Returns the current output and status without waiting. Combine with background=false (default) to read the latest progress of a previously started background command.",
+      "description": "The id of a background shell session to view. When provided, the tool returns the current output and status of that session instead of starting a new command.",
       "type": "string",
     },
     "timeout": {
@@ -106,10 +102,6 @@ Output: Creates directory 'foo'"
       "type": "string",
     },
   },
-  "required": [
-    "command",
-    "description",
-  ],
   "type": "object",
 }
 `;
