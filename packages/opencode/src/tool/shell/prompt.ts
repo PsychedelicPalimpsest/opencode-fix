@@ -306,8 +306,8 @@ export function render(name: string, platform: NodeJS.Platform, limits: Limits, 
 
 export const BACKGROUND_DESCRIPTION = [
   "Run a shell command asynchronously. This tool returns a session_id immediately so you can continue working while the command runs.",
-  "Foreground is the default (`bash`); use `bash_background` for long-running commands, watchers, servers, or any work that does not need to complete before you continue.",
-  "Pass the same session_id back to this tool to view the current output and progress of the background command — combine with no other arguments.",
+  "Only use `bash_background` for long-running processes like servers, watchers, or emulators — use `bash` for short-lived commands.",
+  "The session_id is auto-generated and returned in the tool output. To check a running job, call again with only that id (no command/description). Do not invent your own id.",
   "You will be notified automatically when the command finishes.",
 ].join(" ")
 
