@@ -12,7 +12,7 @@ import { Config } from "@/config/config"
 import { Plugin } from "@/plugin"
 import { Truncate } from "@/tool/truncate"
 import { ChildProcess } from "effect/unstable/process"
-import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+import { ChildProcessSpawner, ExitCode } from "effect/unstable/process/ChildProcessSpawner"
 import { BashArity } from "@/permission/arity"
 import type * as Tool from "@/tool/tool"
 import * as PermissionV1 from "@opencode-ai/core/v1/permission"
@@ -582,7 +582,10 @@ export const run = Effect.fn("ShellToolShared.run")(function* (
       const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
       const exit = yield* Effect.raceAll([
-        handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+        handle.exitCode.pipe(
+          Effect.map((code) => ({ kind: "exit" as const, code })),
+          Effect.catch(() => Effect.succeed({ kind: "exit" as const, code: ExitCode(1) })),
+        ),
         abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
         timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
       ])
